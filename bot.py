@@ -260,11 +260,7 @@ class RotatingProxyTransport(httpx.AsyncBaseTransport):
 
 class InstagramWebAPIClient:
     """
-    Handles real-time HTTP interaction with Instagram's web endpoints:
-    1. Acquires a live CSRF token (`csrftoken`) and session cookies.
-    2. Checks if an email is registered in Instagram's database via the
-       password-recovery flow endpoint (`send_recovery_flow_email/`).
-    3. Triggers Instagram's real-time password recovery email via `send_password_reset/`.
+    Handles real-time HTTP interaction with Instagram's web endpoints.
     """
 
     USER_AGENT = (
@@ -335,18 +331,35 @@ class InstagramWebAPIClient:
             "Referer": referer,
         }
 
+    def _safe_json(self, resp: httpx.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Safely parses a response as JSON.
+        Returns (data, None) on success, or (None, error_message) on failure.
+        """
+        if resp.status_code == 204 or not resp.content:
+            return None, f"Empty response body (HTTP {resp.status_code})."
+        
+        content_type = resp.headers.get("content-type", "").lower()
+        if "application/json" not in content_type:
+            preview = resp.text[:120].replace("\n", " ").strip()
+            return None, f"Non-JSON response (HTTP {resp.status_code}, {content_type}). Body starts with: {preview!r}"
+
+        try:
+            return resp.json(), None
+        except json.JSONDecodeError as exc:
+            return None, f"JSON parse error: {exc}. Body starts with: {resp.text[:120]!r}"
+
     async def check_email_availability(self, email: str) -> Dict[str, Any]:
         """
-        Checks if an email is associated with a recoverable Instagram account
-        by querying the password-recovery flow endpoint. This is far more
-        accurate than the signup-validation endpoint, which merely reports
-        whether an email has ever been "taken" during signup.
+        Checks if an email is associated with a recoverable Instagram account.
+        Uses the recovery flow endpoint with a fallback to the web check_email endpoint.
         """
         if not self.csrf_token:
             ok, info = await self.refresh_csrf_session()
             if not ok:
                 return {"ok": False, "registered": False, "message": info}
 
+        # --- Primary Check: Recovery Flow ---
         url = "https://www.instagram.com/api/v1/accounts/send_recovery_flow_email/"
         headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
         payload = {"email": email}
@@ -358,19 +371,25 @@ class InstagramWebAPIClient:
                 headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
                 resp = await self.client.post(url, data=payload, headers=headers)
 
-            data = resp.json()
+            data, parse_err = self._safe_json(resp)
+            if parse_err:
+                # Fallback to secondary check if primary fails to return JSON
+                fallback = await self._check_email_fallback(email, headers)
+                return {
+                    "ok": fallback.get("ok", False),
+                    "registered": fallback.get("registered", False),
+                    "code": fallback.get("code", "fallback"),
+                    "message": f"Primary check failed ({parse_err}). Fallback result: {fallback.get('message', 'Unknown')}"
+                }
+
             error_msg = (data.get("message") or "").lower()
             errors = data.get("errors", {}) or {}
 
-            # Look for explicit "not found" / "no account" indications
             not_found_signals = (
-                "user not found",
-                "no account",
-                "couldn't find",
-                "could not find",
-                "not associated",
-                "no users found",
+                "user not found", "no account", "couldn't find",
+                "could not find", "not associated", "no users found",
             )
+
             if any(sig in error_msg for sig in not_found_signals):
                 return {
                     "ok": True,
@@ -379,7 +398,6 @@ class InstagramWebAPIClient:
                     "message": "No recoverable Instagram account is associated with this email."
                 }
 
-            # Some responses nest error information in the errors dict
             for field_errors in errors.values():
                 if isinstance(field_errors, list):
                     for err in field_errors:
@@ -392,7 +410,6 @@ class InstagramWebAPIClient:
                                 "message": "No recoverable Instagram account is associated with this email."
                             }
 
-            # A successful recovery flow response indicates the account exists
             if resp.status_code == 200 and (
                 data.get("status") == "ok"
                 or "sent" in error_msg
@@ -406,7 +423,6 @@ class InstagramWebAPIClient:
                     "message": "A recoverable Instagram account is associated with this email."
                 }
 
-            # Any response that reaches here is ambiguous (e.g. rate-limited)
             return {
                 "ok": False,
                 "registered": False,
@@ -416,10 +432,31 @@ class InstagramWebAPIClient:
         except Exception as e:
             return {"ok": False, "registered": False, "code": "exception", "message": str(e)}
 
+    async def _check_email_fallback(self, email: str, headers: Dict[str, str]) -> Dict[str, Any]:
+        """Secondary check using Instagram's web check_email endpoint."""
+        url = "https://www.instagram.com/api/v1/web/accounts/check_email/"
+        payload = {"email": email}
+        try:
+            resp = await self.client.post(url, data=payload, headers=headers)
+            data, parse_err = self._safe_json(resp)
+            if parse_err:
+                return {"ok": False, "registered": False, "code": "fallback_parse_error", "message": parse_err}
+
+            # The check_email endpoint returns {"available": true/false, "valid": true/false, ...}
+            available = data.get("available")
+            if available is False:
+                return {"ok": True, "registered": True, "code": "fallback_taken", "message": "Email is taken (account likely exists)."}
+            elif available is True:
+                return {"ok": True, "registered": False, "code": "fallback_available", "message": "Email is available (no account found)."}
+            
+            return {"ok": False, "registered": False, "code": "fallback_unknown", "message": str(data)}
+        except Exception as e:
+            return {"ok": False, "registered": False, "code": "fallback_exception", "message": str(e)}
+
     async def send_password_reset_email(self, email: str) -> Dict[str, Any]:
         """
         Sends a real-time POST request to Instagram's web account recovery endpoint
-        (`send_password_reset`) to dispatch a reset link to the target email/Gmail.
+        to dispatch a reset link to the target email/Gmail.
         """
         if not self.csrf_token:
             ok, info = await self.refresh_csrf_session()
@@ -437,7 +474,10 @@ class InstagramWebAPIClient:
                 headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
                 resp = await self.client.post(url, data=payload, headers=headers)
 
-            data = resp.json()
+            data, parse_err = self._safe_json(resp)
+            if parse_err:
+                return {"ok": False, "sent": False, "message": f"Invalid response from Instagram: {parse_err}"}
+
             status = data.get("status")
             toast_msg = data.get("toast_message") or data.get("message") or ""
             obfuscated = data.get("obfuscated_email", email)
