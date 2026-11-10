@@ -1,0 +1,15 @@
+{
+  "bot_token": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
+  "owner_id": 987654321,
+  "maintenance_mode": false,
+  "free_daily_limit": 2,
+  "premium_daily_limit": 5,
+  "welcome_media": { "enabled": false, "media_type": "photo", "file_id": "" },
+  "ast_email_policy": "'@' in email and '.' in domain and len(local) >= 2 and not email.endswith('.invalid')",
+  "ig_app_id": "936619743392459",
+  "instagram_proxies": [],
+  "premium_stars_price": 100,
+  "premium_duration_days": 30,
+  "upi_id": "",
+  "upi_price_inr": 199
+}
