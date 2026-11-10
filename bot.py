@@ -23,8 +23,8 @@ FILES = {
 }
 
 DEFAULT_CONFIG = {
-    "bot_token": os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN"),
-    "owner_id": int(os.getenv("OWNER_ID", "123456789")),
+    "bot_token": os.getenv("BOT_TOKEN", "9071346261:AAECfzDiHqctxKhHaCvCNQ2PEYTCcqj4xmA"),
+    "owner_id": int(os.getenv("OWNER_ID", "8684812026")),
     "maintenance_mode": False,
     "free_daily_limit": 2,
     "premium_daily_limit": 5,
