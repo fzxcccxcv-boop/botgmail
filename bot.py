@@ -262,7 +262,8 @@ class InstagramWebAPIClient:
     """
     Handles real-time HTTP interaction with Instagram's web endpoints:
     1. Acquires a live CSRF token (`csrftoken`) and session cookies.
-    2. Checks if an email is registered in Instagram's database via `web_create_ajax/attempt/`.
+    2. Checks if an email is registered in Instagram's database via the
+       password-recovery flow endpoint (`send_recovery_flow_email/`).
     3. Triggers Instagram's real-time password recovery email via `send_password_reset/`.
     """
 
@@ -336,58 +337,81 @@ class InstagramWebAPIClient:
 
     async def check_email_availability(self, email: str) -> Dict[str, Any]:
         """
-        Queries Instagram's signup validation endpoint to check if an email
-        is already linked to an existing account (`email_is_taken`) or available.
+        Checks if an email is associated with a recoverable Instagram account
+        by querying the password-recovery flow endpoint. This is far more
+        accurate than the signup-validation endpoint, which merely reports
+        whether an email has ever been "taken" during signup.
         """
         if not self.csrf_token:
             ok, info = await self.refresh_csrf_session()
             if not ok:
                 return {"ok": False, "registered": False, "message": info}
 
-        url = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
-        headers = self._build_ajax_headers("https://www.instagram.com/accounts/emailsignup/")
-        payload = {
-            "email": email,
-            "username": "",
-            "first_name": "",
-            "opt_into_one_tap": "false"
-        }
+        url = "https://www.instagram.com/api/v1/accounts/send_recovery_flow_email/"
+        headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
+        payload = {"email": email}
 
         try:
             resp = await self.client.post(url, data=payload, headers=headers)
             if resp.status_code == 403:
                 await self.refresh_csrf_session()
-                headers = self._build_ajax_headers("https://www.instagram.com/accounts/emailsignup/")
+                headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
                 resp = await self.client.post(url, data=payload, headers=headers)
 
             data = resp.json()
-            errors = data.get("errors", {})
-            email_errors = errors.get("email", [])
+            error_msg = (data.get("message") or "").lower()
+            errors = data.get("errors", {}) or {}
 
-            for err in email_errors:
-                code = err.get("code", "")
-                msg = err.get("message", "")
-                if code == "email_is_taken" or "another account is using" in msg.lower():
-                    return {
-                        "ok": True,
-                        "registered": True,
-                        "code": code,
-                        "message": "Account found in Instagram database (Email is registered)."
-                    }
-
-            if data.get("status") == "ok":
+            # Look for explicit "not found" / "no account" indications
+            not_found_signals = (
+                "user not found",
+                "no account",
+                "couldn't find",
+                "could not find",
+                "not associated",
+                "no users found",
+            )
+            if any(sig in error_msg for sig in not_found_signals):
                 return {
                     "ok": True,
                     "registered": False,
-                    "code": "available",
-                    "message": "No existing account bound to this email (Available for signup)."
+                    "code": "not_found",
+                    "message": "No recoverable Instagram account is associated with this email."
                 }
 
+            # Some responses nest error information in the errors dict
+            for field_errors in errors.values():
+                if isinstance(field_errors, list):
+                    for err in field_errors:
+                        msg = (err.get("message") or "").lower()
+                        if any(sig in msg for sig in not_found_signals):
+                            return {
+                                "ok": True,
+                                "registered": False,
+                                "code": err.get("code", "not_found"),
+                                "message": "No recoverable Instagram account is associated with this email."
+                            }
+
+            # A successful recovery flow response indicates the account exists
+            if resp.status_code == 200 and (
+                data.get("status") == "ok"
+                or "sent" in error_msg
+                or data.get("flow")
+                or data.get("email")
+            ):
+                return {
+                    "ok": True,
+                    "registered": True,
+                    "code": "recoverable",
+                    "message": "A recoverable Instagram account is associated with this email."
+                }
+
+            # Any response that reaches here is ambiguous (e.g. rate-limited)
             return {
                 "ok": False,
                 "registered": False,
                 "code": f"http_{resp.status_code}",
-                "message": data.get("message", "Rate-limited or unexpected response from Instagram.")
+                "message": error_msg or "Rate-limited or unexpected response from Instagram."
             }
         except Exception as e:
             return {"ok": False, "registered": False, "code": "exception", "message": str(e)}
