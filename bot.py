@@ -24,7 +24,8 @@ FILES = {
 }
 
 DEFAULT_CONFIG = {
-    "bot_token": os.getenv("BOT_TOKEN", "9071346261:AAECfzDiHqctxKhHaCvCNQ2PEYTCcqj4xmA"),
+    # IMPORTANT: Set BOT_TOKEN in your environment or config.json
+    "bot_token": os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE"),
     "owner_id": int(os.getenv("OWNER_ID", "8684812026")),
     "maintenance_mode": False,
     "free_daily_limit": 2,
@@ -48,7 +49,7 @@ DEFAULT_CONFIG = {
 
 
 class JSONDatabaseManager:
-    """Thread-safe JSON file creation, reading, and atomic writing."""
+    """Concurrency-safe JSON file creation, reading, and atomic writing."""
 
     def __init__(self):
         self._ensure_files()
@@ -85,7 +86,8 @@ class JSONDatabaseManager:
 
     def save(self, key: str, data: Dict[str, Any]) -> None:
         path = FILES[key]
-        temp_path = f"{path}.tmp"
+        # Unique temp filename prevents race conditions across concurrent async tasks
+        temp_path = f"{path}.{time.time_ns()}.{random.randint(1000, 9999)}.tmp"
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, path)
@@ -217,15 +219,15 @@ class ASTEmailValidator:
 
 
 # =====================================================================
-# 3. REAL-TIME INSTAGRAM WEB API HANDLER (WITH PROXY ROTATION)
+# 3. REAL-TIME INSTAGRAM WEB API HANDLER (WITH STICKY PROXY ROTATION)
 # =====================================================================
 
 class RotatingProxyTransport(httpx.AsyncBaseTransport):
     """
-    Persistent round-robin proxy transport for httpx.
-    Keeps child AsyncHTTPTransport pools open so response streams can be read
-    safely without premature socket closure, and automatically fails over to
-    the next proxy if a proxy connection drops.
+    Sticky proxy transport for httpx.
+    Keeps using the same active proxy so cookies and CSRF tokens remain bound
+    to a consistent IP, and rotates only when force_rotate() is called or a
+    transport connection error occurs.
     """
 
     def __init__(self, proxies: Sequence[str]):
@@ -235,29 +237,36 @@ class RotatingProxyTransport(httpx.AsyncBaseTransport):
             for url in self._proxy_urls
         ]
         self._cycle = itertools.cycle(self._transports) if self._transports else None
-        self.last_used_proxy: Optional[str] = None
+        self._current: Optional[Tuple[str, httpx.AsyncHTTPTransport]] = (
+            next(self._cycle) if self._cycle else None
+        )
+        self.last_used_proxy: Optional[str] = self._current[0] if self._current else None
 
     def has_proxies(self) -> bool:
         return len(self._transports) > 0
 
-    def force_rotate(self):
-        """Forces the transport to skip to the next proxy in the cycle."""
-        if self._cycle and len(self._transports) > 1:
-            next(self._cycle)
+    def force_rotate(self) -> Optional[str]:
+        """Switches to the next proxy in the pool and returns its URL."""
+        if self._cycle and len(self._transports) > 0:
+            self._current = next(self._cycle)
+            self.last_used_proxy = self._current[0]
+            return self.last_used_proxy
+        return None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if not self._transports:
+        if not self._transports or not self._current:
             default_transport = httpx.AsyncHTTPTransport()
             return await default_transport.handle_async_request(request)
 
         last_exc: Optional[Exception] = None
         for _ in range(len(self._transports)):
-            proxy_url, transport = next(self._cycle)
+            proxy_url, transport = self._current
             self.last_used_proxy = proxy_url
             try:
                 return await transport.handle_async_request(request)
             except httpx.TransportError as exc:
                 last_exc = exc
+                self.force_rotate()
                 continue
 
         raise last_exc or httpx.ConnectError("All configured proxies failed.")
@@ -270,7 +279,7 @@ class RotatingProxyTransport(httpx.AsyncBaseTransport):
 class InstagramWebAPIClient:
     """
     Handles real-time HTTP interaction with Instagram's web endpoints.
-    Includes 429 rate-limit detection, Proxy rotation, and Retry-After handling.
+    Includes 429/403 rate-limit & CSRF recovery, sticky proxy rotation, and Retry-After handling.
     """
 
     USER_AGENT = (
@@ -298,17 +307,21 @@ class InstagramWebAPIClient:
     async def reload_proxies(self) -> int:
         """Hot-reloads the proxy pool from config.json without restarting the bot."""
         old_client = self.client
+        self.csrf_token = None
         self.client = self._build_client()
         await old_client.aclose()
         cfg = db.load("config")
         return len(cfg.get("instagram_proxies", []) or [])
 
     async def fetch_and_test_proxies(self) -> int:
-        """Scrapes free proxies, tests them, and saves working ones."""
+        """Scrapes free proxies, tests them against Instagram, and saves working ones."""
         print("[+] Fetching free proxies...")
         try:
             async with httpx.AsyncClient() as fetch_client:
-                resp = await fetch_client.get("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", timeout=10)
+                resp = await fetch_client.get(
+                    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+                    timeout=10
+                )
                 raw_proxies = resp.text.splitlines()
         except Exception as e:
             print(f"[-] Failed to fetch proxy list: {e}")
@@ -319,21 +332,19 @@ class InstagramWebAPIClient:
             return 0
 
         random.shuffle(candidates)
-        candidates = candidates[:150]  # Limit to test first 150 to save time
+        candidates = candidates[:150]
 
-        working_proxies = []
-        
-        async def test_proxy(proxy_url):
+        async def test_proxy(proxy_url: str) -> Optional[str]:
             try:
                 async with httpx.AsyncClient(proxy=proxy_url, timeout=5.0) as test_client:
-                    r = await test_client.get("https://www.instagram.com/")
-                    if r.status_code == 200:
+                    r = await test_client.get("https://www.instagram.com/accounts/password/reset/")
+                    if r.status_code == 200 and ("csrftoken" in r.cookies or "csrf_token" in r.text):
                         return proxy_url
             except Exception:
                 pass
             return None
 
-        print(f"[+] Testing {len(candidates)} proxies (this may take a moment)...")
+        print(f"[+] Testing {len(candidates)} proxies...")
         results = await asyncio.gather(*[test_proxy(p) for p in candidates])
         working_proxies = [p for p in results if p]
 
@@ -342,22 +353,24 @@ class InstagramWebAPIClient:
             existing = set(cfg.get("instagram_proxies", []))
             for p in working_proxies:
                 existing.add(p)
-            cfg["instagram_proxies"] = list(existing)[:50]  # Cap at 50 to avoid memory bloat
+            cfg["instagram_proxies"] = list(existing)[:50]
             db.save("config", cfg)
             await self.reload_proxies()
             return len(cfg["instagram_proxies"])
-        
+
         return 0
 
     async def refresh_csrf_session(self) -> Tuple[bool, str]:
-        """Fetches fresh cookies and csrftoken from Instagram's signup page."""
+        """Fetches fresh cookies and csrftoken from Instagram's password reset page."""
         try:
-            resp = await self.client.get("https://www.instagram.com/accounts/emailsignup/")
+            self.client.cookies.clear()
+            resp = await self.client.get("https://www.instagram.com/accounts/password/reset/")
             csrf = self.client.cookies.get("csrftoken")
             if not csrf:
                 match = re.search(r'"csrf_token":"([a-zA-Z0-9_-]+)"', resp.text)
                 if match:
                     csrf = match.group(1)
+                    self.client.cookies.set("csrftoken", csrf, domain=".instagram.com")
             if csrf:
                 self.csrf_token = csrf
                 sessions = db.load("sessions")
@@ -388,13 +401,9 @@ class InstagramWebAPIClient:
         }
 
     def _safe_json(self, resp: httpx.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """
-        Safely parses a response as JSON.
-        Returns (data, None) on success, or (None, error_message) on failure.
-        """
         if resp.status_code == 204 or not resp.content:
             return None, f"Empty response body (HTTP {resp.status_code})."
-        
+
         content_type = resp.headers.get("content-type", "").lower()
         if "application/json" not in content_type:
             preview = resp.text[:120].replace("\n", " ").strip()
@@ -409,42 +418,51 @@ class InstagramWebAPIClient:
         self,
         method: str,
         url: str,
-        headers: Dict[str, str],
+        referer: str,
         data: Optional[Dict[str, Any]] = None,
         max_retries: int = 3,
     ) -> Tuple[Optional[httpx.Response], Optional[str]]:
         """
-        Sends a request with proxy rotation on HTTP 429 and exponential backoff.
+        Sends a request, automatically rotating proxies and refreshing CSRF cookies
+        on HTTP 403 or HTTP 429.
         """
         last_error = None
         for attempt in range(max_retries):
+            if not self.csrf_token:
+                await self.refresh_csrf_session()
+
+            headers = self._build_ajax_headers(referer)
             try:
                 if method.upper() == "GET":
                     resp = await self.client.get(url, headers=headers)
                 else:
                     resp = await self.client.post(url, headers=headers, data=data)
 
-                if resp.status_code == 429:
-                    # Switch IP if we have proxies!
+                if resp.status_code in (403, 429):
                     if self.proxy_transport and self.proxy_transport.has_proxies():
-                        self.proxy_transport.force_rotate()
-                        print(f"[!] 429 Rate Limit hit. Rotated IP to: {self.proxy_transport.last_used_proxy}")
+                        new_proxy = self.proxy_transport.force_rotate()
+                        print(f"[!] HTTP {resp.status_code} hit. Rotated IP to: {new_proxy}")
+
+                    # Force fresh CSRF and cookie jar for the new IP
+                    self.csrf_token = None
+                    await self.refresh_csrf_session()
 
                     retry_after = resp.headers.get("Retry-After")
                     wait = int(retry_after) if (retry_after and retry_after.isdigit()) else (2.0 * (2 ** attempt))
-                    
-                    print(f"[!] Instagram 429. Waiting {wait}s (attempt {attempt + 1}/{max_retries})...")
+                    print(f"[!] Waiting {wait}s before retry (attempt {attempt + 1}/{max_retries})...")
                     await asyncio.sleep(wait)
-                    last_error = f"HTTP 429 (rate-limited) after {attempt + 1} attempts."
+                    last_error = f"HTTP {resp.status_code} after {attempt + 1} attempts."
                     continue
 
                 return resp, None
 
             except httpx.TransportError as exc:
                 last_error = f"Transport error: {exc}"
+                if self.proxy_transport and self.proxy_transport.has_proxies():
+                    self.proxy_transport.force_rotate()
+                self.csrf_token = None
                 if attempt < max_retries - 1:
                     wait = 2.0 * (2 ** attempt)
-                    print(f"[!] Transport error: {exc}. Retrying in {wait}s...")
                     await asyncio.sleep(wait)
                 continue
 
@@ -452,129 +470,68 @@ class InstagramWebAPIClient:
 
     async def check_email_availability(self, email: str) -> Dict[str, Any]:
         """
-        Checks if an email is associated with a recoverable Instagram account.
-        Uses the recovery flow endpoint with a fallback to the web check_email endpoint.
-        Handles 429 rate-limits with Retry-After + exponential backoff.
+        Passively checks if an email is registered on Instagram using check_email
+        WITHOUT prematurely sending a password reset email.
         """
         if not self.csrf_token:
             ok, info = await self.refresh_csrf_session()
             if not ok:
                 return {"ok": False, "registered": False, "message": info}
 
-        # --- Primary Check: Recovery Flow ---
-        url = "https://www.instagram.com/api/v1/accounts/send_recovery_flow_email/"
-        headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
-        payload = {"email": email}
-
-        resp, error = await self._request_with_retry("POST", url, headers, data=payload)
+        url = "https://www.instagram.com/api/v1/web/accounts/check_email/"
+        referer = "https://www.instagram.com/accounts/emailsignup/"
+        resp, error = await self._request_with_retry("POST", url, referer, data={"email": email})
 
         if resp is None:
-            # Primary failed after retries — try fallback
-            fallback_resp, fallback_error = await self._request_with_retry(
-                "POST",
-                "https://www.instagram.com/api/v1/web/accounts/check_email/",
-                headers,
-                data={"email": email},
-            )
-            if fallback_resp is not None:
-                data, parse_err = self._safe_json(fallback_resp)
-                if parse_err:
-                    return {"ok": False, "registered": False, "code": "fallback_parse_error", "message": parse_err}
-                available = data.get("available")
-                if available is False:
-                    return {"ok": True, "registered": True, "code": "fallback_taken", "message": "Email is taken (account likely exists)."}
-                elif available is True:
-                    return {"ok": True, "registered": False, "code": "fallback_available", "message": "Email is available (no account found)."}
-                return {"ok": False, "registered": False, "code": "fallback_unknown", "message": str(data)}
-
             return {
                 "ok": False,
                 "registered": False,
                 "code": "rate_limited",
-                "message": f"Both endpoints rate-limited. {error} / {fallback_error}. Try again later or add a proxy."
+                "message": f"Instagram check rate-limited: {error}"
             }
 
         data, parse_err = self._safe_json(resp)
         if parse_err:
-            fallback = await self._check_email_fallback(email, headers)
+            return {"ok": False, "registered": False, "code": "parse_error", "message": parse_err}
+
+        available = data.get("available")
+        if available is False:
             return {
-                "ok": fallback.get("ok", False),
-                "registered": fallback.get("registered", False),
-                "code": fallback.get("code", "fallback"),
-                "message": f"Primary check failed ({parse_err}). Fallback result: {fallback.get('message', 'Unknown')}"
+                "ok": True,
+                "registered": True,
+                "code": "email_taken",
+                "message": "Email is linked to an existing Instagram account (Note: Instagram does not expose the @username publicly)."
             }
-
-        error_msg = (data.get("message") or "").lower()
-        errors = data.get("errors", {}) or {}
-        not_found_signals = (
-            "user not found", "no account", "couldn't find",
-            "could not find", "not associated", "no users found",
-        )
-
-        if any(sig in error_msg for sig in not_found_signals):
-            return {"ok": True, "registered": False, "code": "not_found",
-                    "message": "No recoverable Instagram account is associated with this email."}
-
-        for field_errors in errors.values():
-            if isinstance(field_errors, list):
-                for err in field_errors:
-                    msg = (err.get("message") or "").lower()
-                    if any(sig in msg for sig in not_found_signals):
-                        return {"ok": True, "registered": False, "code": err.get("code", "not_found"),
-                                "message": "No recoverable Instagram account is associated with this email."}
-
-        if resp.status_code == 200 and (
-            data.get("status") == "ok"
-            or "sent" in error_msg
-            or data.get("flow")
-            or data.get("email")
-        ):
-            return {"ok": True, "registered": True, "code": "recoverable",
-                    "message": "A recoverable Instagram account is associated with this email."}
+        elif available is True:
+            return {
+                "ok": True,
+                "registered": False,
+                "code": "email_available",
+                "message": "No Instagram account is registered with this email."
+            }
 
         return {
             "ok": False,
             "registered": False,
             "code": f"http_{resp.status_code}",
-            "message": error_msg or "Rate-limited or unexpected response from Instagram."
+            "message": data.get("message") or "Unexpected response from Instagram."
         }
-
-    async def _check_email_fallback(self, email: str, headers: Dict[str, str]) -> Dict[str, Any]:
-        """Secondary check using Instagram's web check_email endpoint."""
-        url = "https://www.instagram.com/api/v1/web/accounts/check_email/"
-        payload = {"email": email}
-        resp, error = await self._request_with_retry("POST", url, headers, data=payload)
-        if resp is None:
-            return {"ok": False, "registered": False, "code": "fallback_rate_limited", "message": error}
-
-        data, parse_err = self._safe_json(resp)
-        if parse_err:
-            return {"ok": False, "registered": False, "code": "fallback_parse_error", "message": parse_err}
-
-        # The check_email endpoint returns {"available": true/false, "valid": true/false, ...}
-        available = data.get("available")
-        if available is False:
-            return {"ok": True, "registered": True, "code": "fallback_taken", "message": "Email is taken (account likely exists)."}
-        elif available is True:
-            return {"ok": True, "registered": False, "code": "fallback_available", "message": "Email is available (no account found)."}
-        
-        return {"ok": False, "registered": False, "code": "fallback_unknown", "message": str(data)}
 
     async def send_password_reset_email(self, email: str) -> Dict[str, Any]:
         """
-        Sends a real-time POST request to Instagram's web account recovery endpoint
-        to dispatch a reset link to the target email/Gmail.
+        Dispatches a real-time password reset link to the target email via
+        Instagram's web account recovery endpoint.
         """
         if not self.csrf_token:
             ok, info = await self.refresh_csrf_session()
             if not ok:
                 return {"ok": False, "sent": False, "message": info}
 
-        url = "https://www.instagram.com/api/v1/accounts/send_password_reset/"
-        headers = self._build_ajax_headers("https://www.instagram.com/accounts/password/reset/")
-        payload = {"user_email": email}
+        url = "https://www.instagram.com/api/v1/web/accounts/account_recovery_send_ajax/"
+        referer = "https://www.instagram.com/accounts/password/reset/"
+        payload = {"email_or_username": email, "flow": "fxcal"}
 
-        resp, error = await self._request_with_retry("POST", url, headers, data=payload)
+        resp, error = await self._request_with_retry("POST", url, referer, data=payload)
 
         if resp is None:
             return {"ok": False, "sent": False, "message": f"Rate-limited or request failed: {error}"}
@@ -584,21 +541,23 @@ class InstagramWebAPIClient:
             return {"ok": False, "sent": False, "message": f"Invalid response from Instagram: {parse_err}"}
 
         status = data.get("status")
-        toast_msg = data.get("toast_message") or data.get("message") or ""
-        obfuscated = data.get("obfuscated_email", email)
+        body_msg = data.get("body") or data.get("toast_message") or data.get("message") or ""
+        if isinstance(body_msg, dict):
+            body_msg = str(body_msg)
+        obfuscated = data.get("obfuscated_email") or data.get("contact_point") or email
 
-        if resp.status_code == 200 and (status == "ok" or "sent" in toast_msg.lower()):
+        if resp.status_code == 200 and (status == "ok" or "sent" in body_msg.lower()):
             return {
                 "ok": True,
                 "sent": True,
                 "obfuscated_email": obfuscated,
-                "message": toast_msg or f"Reset link dispatched to {obfuscated}."
+                "message": body_msg or f"Reset link dispatched to {obfuscated}."
             }
 
         return {
             "ok": False,
             "sent": False,
-            "message": toast_msg or f"Instagram rejected reset request (HTTP {resp.status_code})."
+            "message": body_msg or f"Instagram rejected reset request (HTTP {resp.status_code})."
         }
 
 
@@ -610,10 +569,6 @@ ig_client = InstagramWebAPIClient()
 # =====================================================================
 
 def btn(text: str, callback_data: str, style: str = "") -> Dict[str, Any]:
-    """
-    Builds a Telegram Bot API 9.4+ InlineKeyboardButton supporting native colored buttons:
-    style values: "primary" (blue), "success" (green), "danger" (red), or "" (default).
-    """
     button: Dict[str, Any] = {"text": text, "callback_data": callback_data}
     if style in ("primary", "success", "danger"):
         button["style"] = style
@@ -621,7 +576,6 @@ def btn(text: str, callback_data: str, style: str = "") -> Dict[str, Any]:
 
 
 def build_auth_gate_keyboard(is_registered: bool) -> Dict[str, Any]:
-    """Shows Register button for new users, or Login button if already registered."""
     if not is_registered:
         return {
             "inline_keyboard": [
@@ -666,11 +620,6 @@ def build_main_menu_keyboard(user_id: int) -> Dict[str, Any]:
 
 
 def build_email_action_keyboard(email: str) -> Dict[str, Any]:
-    """
-    Two core real-time workflow buttons:
-    1. Sending Reset Mail
-    2. Check Email & Back
-    """
     return {
         "inline_keyboard": [
             [btn("1️⃣ Send Reset Mail (Real-Time API)", f"act_reset|{email}", style="success")],
@@ -707,7 +656,10 @@ def build_owner_keyboard() -> Dict[str, Any]:
                 btn("⭐ Toggle User Premium", "own_toggle_prem", style="primary")
             ],
             [
-                btn("📋 All Data Logs", "own_all_logs", style="success"),
+                btn("🇮🇳 Set UPI ID & Price", "own_set_upi", style="success"),
+                btn("📋 All Data Logs", "own_all_logs", style="success")
+            ],
+            [
                 btn("⬅️ Back to User Menu", "menu_home", style="primary")
             ]
         ]
@@ -736,10 +688,6 @@ class TelegramBotApp:
         text: str,
         reply_markup: Dict[str, Any]
     ) -> None:
-        """
-        Renders the Owner-configured photo/video welcome frame at the top of the menu
-        if enabled, falling back to a clean HTML message.
-        """
         cfg = db.load("config")
         media = cfg.get("welcome_media", {})
         if media.get("enabled") and media.get("file_id"):
@@ -778,7 +726,6 @@ class TelegramBotApp:
         user = db.check_and_reset_daily_quota(user_id)
         tier = user.get("tier", "free")
 
-        # Auto-downgrade if premium expired
         if tier == "premium" and user.get("premium_expiry"):
             try:
                 if datetime.fromisoformat(user["premium_expiry"]) < datetime.now():
@@ -797,14 +744,12 @@ class TelegramBotApp:
     # Telegram Stars Payment Lifecycle
     # -----------------------------------------------------------------
     async def handle_pre_checkout_query(self, pcq: Dict[str, Any]) -> None:
-        """Answer pre_checkout_query immediately so Telegram does not time out."""
         await self.api("answerPreCheckoutQuery", {
             "pre_checkout_query_id": pcq["id"],
             "ok": True,
         })
 
     async def _handle_successful_payment(self, msg: Dict[str, Any]) -> None:
-        """Upgrade the payer to premium upon successful Telegram Stars payment."""
         user_id = msg["from"]["id"]
         chat_id = msg["chat"]["id"]
         payment = msg["successful_payment"]
@@ -818,7 +763,7 @@ class TelegramBotApp:
 
         charge_id = payment.get("telegram_payment_charge_id")
         if user.get("last_charge_id") == charge_id:
-            return  # Idempotency guard
+            return
 
         user["tier"] = "premium"
         user["premium_expiry"] = (datetime.now() + timedelta(days=duration)).isoformat()
@@ -852,7 +797,6 @@ class TelegramBotApp:
         username = msg["from"].get("username", "User")
         text = msg.get("text", "").strip()
 
-        # Always process payments first so they complete even during maintenance
         if "successful_payment" in msg:
             await self._handle_successful_payment(msg)
             return
@@ -860,7 +804,6 @@ class TelegramBotApp:
         cfg = db.load("config")
         is_owner = (user_id == cfg.get("owner_id"))
 
-        # Check Maintenance Mode
         if cfg.get("maintenance_mode") and not is_owner:
             await self.api("sendMessage", {
                 "chat_id": chat_id,
@@ -881,7 +824,6 @@ class TelegramBotApp:
         state = db.get_state(user_id)
         step = state.get("step", "idle")
 
-        # Handle /start command
         if text.startswith("/start"):
             db.clear_state(user_id)
             if not user or not user.get("registered"):
@@ -916,7 +858,7 @@ class TelegramBotApp:
             await self.send_menu_with_frame(chat_id, menu_text, build_main_menu_keyboard(user_id))
             return
 
-        # Handle Owner Media Upload (Photo / Video Frame)
+        # Handle Owner Media Upload
         if step == "owner_awaiting_media" and is_owner:
             file_id = None
             m_type = "photo"
@@ -980,7 +922,7 @@ class TelegramBotApp:
             })
             return
 
-        # Handle UPI Proof (screenshot or UTR forwarded to owner with 1-click Approve/Reject)
+        # Handle UPI Proof
         if step == "awaiting_upi_proof":
             owner_id = cfg.get("owner_id")
             if owner_id:
@@ -1104,6 +1046,8 @@ class TelegramBotApp:
             })
 
             ig_res = await ig_client.check_email_availability(text)
+            user = db.check_and_reset_daily_quota(user_id)
+            user["daily_used"] = user.get("daily_used", 0) + 1
             user["email_checks_count"] = user.get("email_checks_count", 0) + 1
             db.save_user(user_id, user)
             db.log_event(
@@ -1268,7 +1212,6 @@ class TelegramBotApp:
             })
             return
 
-        # Require logged-in state for menu actions
         if not user or not user.get("logged_in"):
             await self.api("sendMessage", {
                 "chat_id": chat_id,
@@ -1396,10 +1339,24 @@ class TelegramBotApp:
             })
             return
 
-        # Button 2: Just Check Email Available or Not & Go Back
+        # Button 2: Check Email Available or Not & Go Back (Quota Enforced)
         if data.startswith("act_recheck|"):
             email = data.split("|", 1)[1]
+            used, limit, rem = self._get_quota_info(user_id)
+            if rem <= 0 and not is_owner:
+                await self.api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"⛔ Daily quota exhausted ({used}/{limit}). Upgrade to Premium for 5 daily uses.",
+                    "reply_markup": build_main_menu_keyboard(user_id)
+                })
+                return
+
             ig_res = await ig_client.check_email_availability(email)
+            user = db.check_and_reset_daily_quota(user_id)
+            user["daily_used"] = user.get("daily_used", 0) + 1
+            user["email_checks_count"] = user.get("email_checks_count", 0) + 1
+            db.save_user(user_id, user)
+
             db.log_event(
                 user_id, email, "check_email",
                 "FOUND" if ig_res.get("registered") else "NOT_FOUND",
@@ -1501,7 +1458,6 @@ class TelegramBotApp:
             })
             return
 
-        # One-click UPI Approve / Reject callbacks
         if data.startswith("upi_ok|"):
             target_uid = int(data.split("|", 1)[1])
             t_user = db.get_user(target_uid)
