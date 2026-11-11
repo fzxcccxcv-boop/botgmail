@@ -25,7 +25,7 @@ FILES = {
 
 DEFAULT_CONFIG = {
     # IMPORTANT: Set BOT_TOKEN in your environment or config.json
-    "bot_token": os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE"),
+    "bot_token": os.getenv("BOT_TOKEN", "9071346261:AAECfzDiHqctxKhHaCvCNQ2PEYTCcqj4xmA"),
     "owner_id": int(os.getenv("OWNER_ID", "8684812026")),
     "maintenance_mode": False,
     "free_daily_limit": 2,
